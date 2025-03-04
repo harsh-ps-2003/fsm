@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package fsm.v1;
+
+message FSM {
+  string alias = 1;
+
+  string action = 2;
+
+  string type_name = 3;
+
+  string start_state = 4;
+
+  string end_state = 5;
+
+  repeated string transitions = 6;
+}
+
+message ActiveFSM {
+  string id = 1;
+
+  string action = 2;
+
+  string version = 3;
+
+  string error = 4;
+
+  RunState run_state = 5;
+
+  string transition_version = 6;
+
+  string current_state = 7;
+
+  string queue = 8;
+}
+
+enum RunState {
+  RUN_STATE_UNSPECIFIED = 0;
+  RUN_STATE_PENDING = 1;
+  RUN_STATE_RUNNING = 2;
+  RUN_STATE_COMPLETE = 3;
+}

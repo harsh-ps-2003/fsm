@@ -1,0 +1,17 @@
+version: v1
+managed:
+  enabled: true
+  go_package_prefix:
+    default: github.com/superfly/fsm/gen
+plugins:
+  - name: go
+    out: gen
+    path: ["go", "run", "google.golang.org/protobuf/cmd/protoc-gen-go"]
+    opt:
+      - paths=source_relative
+  - name: connect-go
+    out: gen
+    path: ["go", "run", "connectrpc.com/connect/cmd/protoc-gen-connect-go"]
+    opt:
+      - paths=source_relative
+

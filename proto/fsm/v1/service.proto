@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package fsm.v1;
+
+import "fsm/v1/fsm.proto";
+import "fsm/v1/event.proto";
+
+service FSMService {
+  rpc ListRegistered(ListRegisteredRequest) returns (ListRegisteredResponse) {}
+  rpc ListActive(ListActiveRequest) returns (ListActiveResponse) {}
+  rpc GetHistoryEvent(GetHistoryEventRequest) returns (HistoryEvent) {}
+}
+
+message ListRegisteredRequest {}
+
+message ListRegisteredResponse {
+  repeated fsm.v1.FSM fsms = 1;
+}
+
+message ListActiveRequest {}
+
+message ListActiveResponse {
+  repeated fsm.v1.ActiveFSM active = 1;
+}
+
+message GetHistoryEventRequest {
+  string run_version = 1;
+}

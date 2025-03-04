@@ -1,0 +1,8 @@
+version: v1
+name: buf.build/superfly/flyd
+lint:
+  use:
+    - DEFAULT
+breaking:
+  use:
+    - FILE

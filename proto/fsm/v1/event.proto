@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package fsm.v1;
+
+message ActiveEvent {
+  bytes start_event = 1;
+
+  bytes start_version = 2;
+
+  bytes end_event = 3;
+
+  string action = 4;
+
+  string resource_id = 5;
+
+  bytes resource = 6;
+
+  repeated string transitions = 7;
+
+  EventOptions options = 8;
+
+  map<string, string> trace_context = 9;
+}
+
+message EventOptions {
+  int64 delay_until = 1;
+
+  bytes run_after = 2;
+
+  string queue = 3;
+
+  bytes parent = 4;
+}
+
+message StateEvent {
+  EventType type = 1;
+
+  string id = 2;
+
+  string resource_type = 3;
+
+  string action = 4;
+
+  string state = 5;
+
+  string error = 6;
+
+  bytes response = 7;
+
+  uint64 retry_count = 8;
+
+  bytes run_version = 9;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_START = 1;
+  EVENT_TYPE_ERROR = 2;
+  EVENT_TYPE_COMPLETE = 3;
+  EVENT_TYPE_FINISH = 4;
+  EVENT_TYPE_CANCEL = 5;
+}
+
+message HistoryEvent {
+  ActiveEvent active_event = 1;
+
+  StateEvent last_event = 2;
+}
