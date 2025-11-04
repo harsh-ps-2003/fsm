@@ -1,3 +1,6 @@
+// Package fsm contains the builder API for registering FSMs.
+// This file provides a fluent builder pattern for defining FSM state machines
+// with their transitions, initializers, interceptors, and finalizers.
 package fsm
 
 import (
@@ -13,33 +16,57 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// fsmStart is the builder state after calling Register. It supports:
+//   - Start(): Define the initial transition
 type fsmStart[R, W any] struct {
 	transitionStep[R, W]
 }
 
+// fsmTransition is the builder state after calling Start or To. It supports:
+//   - To(): Add another transition
+//   - End(): Complete the FSM definition
 type fsmTransition[R, W any] struct {
 	transitionStep[R, W]
 }
 
+// fsmEnd is the builder state after calling End. It supports:
+//   - Build(): Finalize the FSM and return start/resume functions
 type fsmEnd[R, W any] struct {
 	transitionStep[R, W]
 }
 
+// transitionStep is the shared state for all builder stages.
 type transitionStep[R, W any] struct {
+	// m is the Manager this FSM will be registered with.
 	m *Manager
 
+	// f is the FSM definition being built.
 	f *fsm
 
+	// cfg accumulates transition configuration (initializers, interceptors, finalizers).
 	cfg *TransitionConfig[R, W]
 
+	// buildError accumulates any errors encountered during building.
 	buildError error
 }
 
+// nameable is an interface that request types can implement to provide
+// a custom resource name for metrics and logging. If not implemented,
+// the type name is converted to snake_case automatically.
 type nameable interface {
 	Name() string
 }
 
-// Register creates a new FSM and returns a builder to configure it.
+// Register creates a new FSM builder for the given action and request/response types.
+// The action name uniquely identifies this workflow (e.g., "deploy", "migrate").
+// R is the request type (input) and W is the response type (output).
+//
+// Example:
+//   start, resume, _ := fsm.Register[DeployRequest, DeployResponse](manager, "deploy").
+//       Start("fetch", fetchImage).
+//       To("unpack", unpackImage).
+//       End("activate", activateContainer).
+//       Build(ctx)
 func Register[R, W any](m *Manager, action string) *fsmStart[R, W] {
 	var (
 		r     R
@@ -92,14 +119,20 @@ func getType(myvar any) string {
 	return t.Name()
 }
 
+// TransitionConfig accumulates configuration for transitions during FSM building.
+// Different configuration types can only be set at specific builder stages.
 type TransitionConfig[R, W any] struct {
-	// initializers can only be configured when calling Start.
+	// initializers are functions that run before the first transition.
+	// They can only be configured when calling Start().
 	initializers []Initializer[R, W]
 
-	// interceptors can be configured when calling Start or To.
+	// interceptors wrap transition functions with cross-cutting concerns
+	// (retry, cancellation, logging, etc.). They can be configured when
+	// calling Start() or To().
 	interceptors []TransitionInterceptorFunc
 
-	// finalizers can only be configured when calling End.
+	// finalizers are functions that run after the FSM completes.
+	// They can only be configured when calling End().
 	finalizers []Finalizer[R, W]
 }
 
@@ -173,7 +206,11 @@ func WithFinalizers[R, W any](f ...Finalizer[R, W]) EndOption[R, W] {
 
 type Transition[R, W any] func(context.Context, *Request[R, W]) (*Response[W], error)
 
-// Starts sets the initial state of the FSM and applies any options to the transition.
+// Start defines the initial transition (state) of the FSM and applies any options.
+// This must be called first after Register(). The name is the state name, and
+// transition is the function that executes when entering this state.
+//
+// Start options can include initializers and interceptors that apply to the entire FSM.
 func (s *fsmStart[R, W]) Start(name string, transition Transition[R, W], startOpts ...StartOption[R, W]) *fsmTransition[R, W] {
 	s.f.startState = name
 
@@ -186,7 +223,11 @@ func (s *fsmStart[R, W]) Start(name string, transition Transition[R, W], startOp
 	return (&fsmTransition[R, W]{s.transitionStep}).To(name, transition, opts...)
 }
 
-// To sets the next state of the FSM and applies any options to the transition.
+// To adds another transition to the FSM. Transitions execute in the order they
+// are added. The name is the state name, and transition is the function that
+// executes when entering this state.
+//
+// Options can include interceptors that apply only to this transition.
 func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts ...Option[R, W]) *fsmTransition[R, W] {
 	tk := transitionKey{
 		action:   s.f.action,
@@ -220,7 +261,11 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 	return &fsmTransition[R, W]{s.transitionStep}
 }
 
-// End sets the final state of the FSM and applies any options as a global option for the FSM.
+// End defines the final transition (state) of the FSM and completes the builder.
+// This must be called last. The name is the final state name, and a finisher
+// function is automatically created that runs finalizers and marks the FSM complete.
+//
+// End options can include finalizers that run when the FSM completes.
 func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[R, W] {
 	fk := fsmKey{
 		name:   s.f.typeName,
@@ -267,12 +312,22 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 	return &fsmEnd[R, W]{s.transitionStep}
 }
 
+// Start is the function type returned by Build() for starting new FSM executions.
+// It takes a context, resource ID, request, and optional start options, and returns
+// the FSM's StartVersion (ULID) which can be used to track/wait for completion.
 type Start[R, W any] func(ctx context.Context, id string, req *Request[R, W], opts ...StartOptionsFn) (ulid.ULID, error)
 
+// Resume is the function type returned by Build() for resuming interrupted FSMs.
+// It should be called during application startup to recover FSMs that were interrupted
+// by a process restart.
 type Resume func(context.Context) error
 
-// Build returns a function that can be used to run the FSM as well as resume any previously
-// started runs.
+// Build finalizes the FSM definition and returns:
+//   1. A Start function for starting new FSM executions
+//   2. A Resume function for resuming interrupted FSMs
+//   3. An error if the FSM definition is invalid
+//
+// After Build() is called, the FSM is registered with the Manager and ready to use.
 func (s *fsmEnd[R, W]) Build(ctx context.Context) (Start[R, W], Resume, error) {
 	if s.buildError != nil {
 		return nil, nil, s.buildError
@@ -288,6 +343,13 @@ func (s *fsmEnd[R, W]) Build(ctx context.Context) (Start[R, W], Resume, error) {
 	return start[R, W](s.m, s.f), wrappedResume, nil
 }
 
+// determineCodec automatically selects an appropriate codec for serializing/deserializing
+// the given type. It checks:
+//   1. If the type implements Codec, use it directly
+//   2. If the type implements proto.Message, use protoBinaryCodec
+//   3. Otherwise, try jsonCodec (requires JSON marshal/unmarshal support)
+//
+// This allows the FSM to work with various message types without explicit codec configuration.
 func determineCodec(logger logrus.FieldLogger, req any) (Codec, error) {
 	if codec, ok := req.(Codec); ok {
 		logger.Info("using provided codec")

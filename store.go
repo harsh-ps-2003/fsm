@@ -1,3 +1,6 @@
+// Package fsm contains the persistent storage layer for FSM state.
+// This file implements the store interface that persists FSM state to disk
+// using BoltDB for durability and recovery after process restarts.
 package fsm
 
 import (
@@ -21,50 +24,98 @@ import (
 )
 
 const (
+	// stateDB is the filename for the main state database (BoltDB).
+	// This stores active FSMs, events, and archive metadata.
 	stateDB   = "fsm-state.db"
+	
+	// historyDB is the filename for the history database (BoltDB).
+	// This stores archived FSM history organized by date for long-term retention.
 	historyDB = "fsm-history.db"
 )
 
 var (
+	// Bucket names for organizing data in BoltDB:
+	//   - ACTIVE: Currently running FSMs (keyed by resource type + ID)
+	//   - ARCHIVE: FSMs pending archival (moved here when they complete)
+	//   - EVENTS: All state events (START, COMPLETE, ERROR, etc.)
+	//   - CHILDREN: Parent-child relationships (parent version -> child version)
+	//   - HISTORY: Archived FSM history organized by date
 	activeBucket   = []byte("ACTIVE")
 	archiveBucket  = []byte("ARCHIVE")
 	eventsBucket   = []byte("EVENTS")
 	childrenBucket = []byte("CHILDREN")
 	historyBucket  = []byte("HISTORY")
 
+	// keySeparator is used to construct composite keys in BoltDB.
+	// Keys are formatted as: "part1#part2#part3" for hierarchical access.
 	keySeparator = []byte("#")
 	emptyPrefix  = []byte{}
 
 	errInvalidEventType = errors.New("invalid event type")
-
-	errEventArchived = errors.New("event archived")
+	errEventArchived    = errors.New("event archived")
 )
 
+// store manages persistent storage for FSM state using BoltDB.
+// It provides:
+//   - Persistence of active FSM state (request, response, transitions)
+//   - Event logging for all state changes
+//   - Archival of completed FSMs to history
+//   - Parent-child relationship tracking
+//   - Query support for resuming active FSMs
+//
+// The store uses two BoltDB databases:
+//   - stateDB: Active state, events, and archive queue
+//   - historyDB: Long-term archive organized by date
+//
+// Key structure:
+//   - ACTIVE: "<resource_type>#<resource_id>#<action>#<run_version>"
+//   - EVENTS: "<resource_id>#<action>#<run_version>#<event_version>"
+//   - ARCHIVE: "<run_version>"
+//   - CHILDREN: "<parent_version>#<child_version>"
+//   - HISTORY: "<date>#<run_version>"
 type store struct {
+	// logger is used for structured logging of store operations.
 	logger logrus.FieldLogger
 
+	// tracer is used for distributed tracing of store operations.
 	tracer trace.Tracer
 
+	// cancel is used to stop the archive loop during shutdown.
 	cancel context.CancelFunc
 
+	// db is the main BoltDB database for active state and events.
 	db *bbolt.DB
 
+	// history is the BoltDB database for archived FSM history.
 	history *bbolt.DB
 
+	// memDB is the in-memory database used for fast lookups and synchronization.
+	// It mirrors some state from db for performance.
 	memDB *memdb.MemDB
 
-	// archiveCh is only used in tests to signal the archive loop to run.
+	// archiveCh is a channel used to trigger the archive loop manually (mainly for tests).
 	archiveCh chan struct{}
 }
 
+// newStore creates a new store instance with the provided configuration.
+// It:
+//   1. Opens/creates the state database (BoltDB)
+//   2. Creates required buckets (ACTIVE, EVENTS, ARCHIVE, CHILDREN)
+//   3. Opens/creates the history database
+//   4. Starts the archive loop in a background goroutine
+//
+// The archive loop periodically moves completed FSMs from ARCHIVE to HISTORY
+// for long-term storage and cleanup.
 func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB *memdb.MemDB) (*store, error) {
+	// Open the main state database. The file is created if it doesn't exist.
 	db, err := bbolt.Open(filepath.Join(path, stateDB), 0o600, &bbolt.Options{
-		Timeout: 1 * time.Second,
+		Timeout: 1 * time.Second, // Timeout for file locking
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	// Initialize required buckets in the state database.
 	if err := db.Update(func(tx *bbolt.Tx) error {
 		if _, err := tx.CreateBucketIfNotExists(activeBucket); err != nil {
 			return err
@@ -83,6 +134,7 @@ func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB
 		return nil, err
 	}
 
+	// Open the history database for long-term archive storage.
 	history, err := bbolt.Open(filepath.Join(path, historyDB), 0o600, &bbolt.Options{
 		Timeout: 1 * time.Second,
 	})
@@ -90,6 +142,7 @@ func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB
 		return nil, err
 	}
 
+	// Create a cancellable context for the archive loop.
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &store{
 		logger:    logger,
@@ -101,25 +154,38 @@ func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB
 		memDB:     memDB,
 	}
 
+	// Start the archive loop in a background goroutine.
+	// This periodically moves completed FSMs to history and cleans up old events.
 	go s.archive(ctx)
 
 	return s, nil
 }
 
+// Close gracefully shuts down the store by:
+//   1. Cancelling the archive loop context
+//   2. Waiting for the archive loop to finish
+//   3. Closing both BoltDB databases
+//
+// This ensures all pending archive operations complete before shutdown.
 func (s *store) Close() error {
 	s.logger.Info("shutting down store")
 
 	var err error
+	
+	// Cancel the archive loop context to signal shutdown.
 	s.cancel()
 
+	// Wait for the archive loop to finish its current operation.
 	s.logger.Info("waiting for archive loop to finish")
 	<-s.archiveCh
 	s.logger.Info("archive loop finished")
 
+	// Close the state database.
 	if err := s.db.Close(); err != nil {
 		err = fmt.Errorf("failed to close state db, %w", err)
 	}
 
+	// Close the history database.
 	if err := s.history.Close(); err != nil {
 		err = errors.Join(err, fmt.Errorf("failed to close history db, %w", err))
 	}
@@ -127,14 +193,28 @@ func (s *store) Close() error {
 	return err
 }
 
+// archiveEvent represents an FSM that is ready to be archived.
+// It contains the archive key and the history event data.
 type archiveEvent struct {
+	// archiveKey is the key in the ARCHIVE bucket (the run version).
 	archiveKey []byte
 
+	// historyEvent contains the complete FSM history (start event + end event).
 	historyEvent *fsmv1.HistoryEvent
 }
 
-func (s *store) archive(ctx context.Context) {
+// archive runs in a background goroutine and periodically archives completed FSMs.
+// The archive process:
+//   1. Gathers all FSMs in the ARCHIVE bucket
+//   2. Groups them by date (based on start time)
+//   3. Writes them to the history database organized by date
+//   4. Deletes old events and children from the state database
+//   5. Removes the FSMs from the ARCHIVE bucket
+//
+// This runs every minute or when manually triggered via archiveCh (for tests).
 	// TODO: clear out date buckets older than X days
+func (s *store) archive(ctx context.Context) {
+	// runArchive performs a single archive operation.
 	runArchive := func(ctx context.Context) {
 		ctx, rootSpan := s.tracer.Start(ctx, "store.archive")
 		defer rootSpan.End()
@@ -311,20 +391,40 @@ func (s *store) archive(ctx context.Context) {
 	}
 }
 
+// activeResource represents an FSM that is currently active (not yet completed).
+// This is used when resuming FSMs after a process restart.
 type activeResource struct {
+	// version is the StartVersion (ULID) of the FSM run.
 	version ulid.ULID
 
+	// active contains the persisted FSM state (request, transitions, options).
 	active *fsmv1.ActiveEvent
 
+	// completedTransitions is a list of transition names that have already
+	// completed successfully. These will be skipped during resume.
 	completedTransitions []string
 
+	// response contains the serialized response accumulated so far.
+	// This may be nil if no transitions have completed yet.
 	response []byte
 
+	// retryCount is the number of retry attempts for the current transition.
+	// This is preserved so exponential backoff continues correctly after restart.
 	retryCount uint64
 
+	// fsmError captures any error that occurred (if the FSM was cancelled or failed).
 	fsmError RunErr
 }
 
+// Active queries the store for all active FSMs of the given type.
+// Active FSMs are those that have a START event but no FINISH event.
+// This is used during Manager startup to resume interrupted FSMs.
+//
+// The function:
+//   1. Scans the ACTIVE bucket for FSMs matching the resource type
+//   2. Reads all events for each FSM to determine completed transitions
+//   3. Extracts the response and retry count
+//   4. Returns a list of active resources ready for resume
 func (s *store) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
 	var (
 		resourceType         = f.typeName
@@ -433,21 +533,32 @@ func (s *store) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
 	return activeEvents, nil
 }
 
+// appendOptionFunc is a function that modifies append options when appending an event.
+// Multiple options can be combined to configure event metadata.
 type appendOptionFunc func(*appendOption) error
 
+// appendOption configures how an event is appended to the store.
+// Different event types use different subsets of these options.
 type appendOption struct {
+	// delayUntil is a Unix timestamp for delayed start (for START events).
 	delayUntil int64
 
+	// runAfter is a serialized ULID of a parent FSM to wait for (for START events).
 	runAfter []byte
 
+	// parent is a serialized ULID of a parent FSM (for START events).
 	parent []byte
 
+	// start contains FSM initialization data (only for START events).
 	start *startOption
 }
 
+// startOption contains data needed to initialize a new FSM run.
 type startOption struct {
+	// transitions is the ordered list of transition names to execute.
 	transitions []string
 
+	// resource is the serialized request message (R).
 	resource []byte
 }
 
@@ -498,6 +609,17 @@ func withParent(parent ulid.ULID) appendOptionFunc {
 	}
 }
 
+// Append appends a state event to the store. This is the primary write operation
+// for FSM state changes. It handles:
+//   - START: Creates an active FSM entry
+//   - COMPLETE: Records a successful transition completion
+//   - ERROR: Records a transition error (for retry tracking)
+//   - CANCEL: Records a cancelled transition
+//   - FINISH: Marks the FSM as complete and moves it to archive
+//
+// The function returns the event version (ULID) which uniquely identifies this event.
+// Events are stored in the EVENTS bucket and indexed by:
+//   "<resource_id>#<action>#<run_version>#<event_version>"
 func (s *store) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error) {
 	var ao appendOption
 	for _, opt := range opts {
@@ -712,6 +834,11 @@ func (s *store) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, qu
 	return eventVersion, nil
 }
 
+// History retrieves the complete history for a completed FSM run.
+// It first checks the ARCHIVE bucket (recently completed FSMs), then falls
+// back to the HISTORY database (older archived FSMs organized by date).
+//
+// Returns ErrFsmNotFound if the FSM doesn't exist or hasn't completed yet.
 func (s *store) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error) {
 	runVersionBytes, err := runVersion.MarshalText()
 	if err != nil {
@@ -768,6 +895,10 @@ func (s *store) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.Histo
 	return &historyEvent, err
 }
 
+// Children returns all child FSM versions for a given parent FSM version.
+// This is used to track FSM hierarchies and dependencies.
+// The children are stored in the CHILDREN bucket with keys:
+//   "<parent_version>#<child_version>"
 func (s *store) Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error) {
 	parentyBytes, err := parent.MarshalText()
 	if err != nil {

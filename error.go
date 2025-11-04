@@ -1,3 +1,6 @@
+// Package fsm contains error types for FSM operations.
+// These errors provide structured information about failure modes and allow
+// the FSM to make decisions about retry, cancellation, and error handling.
 package fsm
 
 import (
@@ -8,6 +11,8 @@ import (
 )
 
 var (
+	// ErrFsmNotFound is returned when querying for an FSM that doesn't exist
+	// or hasn't completed yet.
 	ErrFsmNotFound = errors.New("FSM not found")
 )
 

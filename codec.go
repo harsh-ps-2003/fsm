@@ -1,3 +1,5 @@
+// Package fsm contains codec implementations for serializing/deserializing
+// FSM request and response messages for persistence.
 package fsm
 
 import (
@@ -7,16 +9,16 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Codec is an interface for serializing and deserializing messages.
+// The FSM library automatically selects an appropriate codec based on the
+// message type, but custom codecs can be implemented for special cases.
 type Codec interface {
-	// Marshal marshals the given message.
-	//
-	// Marshal may expect a specific type of message, and will error if this type
-	// is not given.
+	// Marshal serializes the given message to bytes for persistence.
+	// The message type must be compatible with this codec's encoding format.
 	Marshal(any) ([]byte, error)
-	// Unmarshal unmarshals the given message.
-	//
-	// Unmarshal may expect a specific type of message, and will error if this
-	// type is not given.
+	
+	// Unmarshal deserializes bytes into the given message.
+	// The message type must be compatible with this codec's encoding format.
 	Unmarshal([]byte, any) error
 }
 

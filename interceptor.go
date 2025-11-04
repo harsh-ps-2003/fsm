@@ -1,3 +1,5 @@
+// Package fsm contains interceptor implementations that wrap transition functions
+// with cross-cutting concerns like retry logic, cancellation handling, and metrics.
 package fsm
 
 import (
@@ -66,7 +68,9 @@ func finisher[R, W any](m *Manager, finalizers []FinalizerFunc) func(context.Con
 	}
 }
 
-// skipper will skip executing the next transition if the FSM has already errored.
+// skipper is an interceptor that skips transition execution if the FSM has
+// already encountered an error. This prevents executing subsequent transitions
+// after a failure, allowing the FSM to fail fast.
 func skipper() TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
@@ -79,6 +83,12 @@ func skipper() TransitionInterceptorFunc {
 	})
 }
 
+// canceller is an interceptor that handles transition completion and cancellation.
+// It:
+//   1. Calls the next transition
+//   2. If successful, persists the response and records a COMPLETE event
+//   3. If cancelled (haltError), records a CANCEL event
+//   4. Returns the result to the caller
 func canceller(store *store, codec Codec) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
@@ -124,6 +134,14 @@ func canceller(store *store, codec Codec) TransitionInterceptorFunc {
 	})
 }
 
+// retry is an interceptor that implements exponential backoff retry logic.
+// It:
+//   1. Wraps transition execution with retry logic
+//   2. Retries on transient errors with exponential backoff
+//   3. Stops retrying on permanent errors (AbortError, UnrecoverableError, etc.)
+//   4. Records ERROR events periodically during retries
+//   5. Creates new trace spans for each retry attempt
+//   6. Handles panics by recovering and recording them as errors
 func retry(tracer trace.Tracer, store *store) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {

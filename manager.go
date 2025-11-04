@@ -1,3 +1,6 @@
+// Package fsm contains the Manager, which is the main entry point for using the FSM library.
+// The Manager handles FSM registration, execution, lifecycle management, and provides
+// administrative APIs for monitoring and controlling FSMs.
 package fsm
 
 import (
@@ -25,17 +28,20 @@ import (
 )
 
 const (
+	// Table and index names for the in-memory database.
 	fsmTable          = "fsm"
-	idIndex           = "id"
-	runIndex          = "run"
+	idIndex           = "id"           // Index by StartVersion (ULID)
+	runIndex          = "run"          // Index by Run.ID (string)
 	runPrefixIndex    = runIndex + "_prefix"
-	parentIndex       = "parent"
+	parentIndex       = "parent"       // Index by Parent ULID
 	parentPrefixIndex = parentIndex + "_prefix"
 
-	tracerName = "fsm"
+	tracerName = "fsm" // Name for OpenTelemetry tracer
 )
 
 var (
+	// fsmSchema defines the schema for the in-memory database (memdb).
+	// This provides fast lookups for active FSMs and supports watching for state changes.
 	fsmSchema = &memdb.DBSchema{
 		Tables: map[string]*memdb.TableSchema{
 			fsmTable: {
@@ -71,45 +77,81 @@ var (
 	}
 )
 
+// Manager is the central coordinator for all FSM operations. It:
+//   - Registers FSM definitions
+//   - Starts and manages FSM executions
+//   - Provides APIs for querying active FSMs
+//   - Handles graceful shutdown
+//   - Exposes an admin API over HTTP/2 (via Unix socket)
+//
+// A single Manager instance should be created at application startup and reused
+// throughout the application lifetime.
 type Manager struct {
+	// logger is used for structured logging of Manager operations.
 	logger logrus.FieldLogger
 
+	// tracer is used for distributed tracing of FSM operations.
 	tracer trace.Tracer
 
+	// wg tracks running FSM goroutines for graceful shutdown.
 	wg sync.WaitGroup
 
+	// db is the in-memory database for fast FSM state lookups.
+	// It mirrors some state from the persistent store for performance.
 	db *memdb.MemDB
 
+	// store is the persistent storage layer for FSM state.
 	store *store
 
+	// fsms maps FSM keys (typeName + action) to their registered definitions.
 	fsms map[fsmKey]*fsm
 
+	// queues maps queue names to their queue runners for rate limiting.
 	queues map[string]*queuedRunner
 
+	// done is closed when the Manager is shutting down.
 	done chan struct{}
 
+	// mu protects the running map from concurrent access.
 	mu      sync.RWMutex
+	
+	// running maps FSM StartVersions to their cancellation functions.
+	// This allows cancelling FSMs externally via Manager.Cancel().
 	running map[ulid.ULID]context.CancelCauseFunc
 }
 
+// fsmKey uniquely identifies an FSM definition by type name and action.
 type fsmKey struct {
+	// name is the request type name (e.g., "DeployRequest").
 	name string
 
+	// action is the action name (e.g., "deploy").
 	action string
 }
 
+// Config configures a new Manager instance.
 type Config struct {
+	// Logger is the logger to use. If nil, a new logrus.Logger is created.
 	Logger logrus.FieldLogger
 
-	// DBPath is the directory to use for persisting FSM state.
+	// DBPath is the directory path where FSM state will be persisted.
+	// This directory will be created if it doesn't exist.
 	DBPath string
 
-	// Qeues defines which queues are available for FSMs to use. The key is the queue name and the
-	// value is the maximum number of FSMs that can run concurrently.
+	// Queues defines named queues for rate limiting. The map key is the queue name,
+	// and the value is the maximum number of FSMs that can run concurrently in that queue.
+	// FSMs assigned to a queue will wait if the queue is at capacity.
 	Queues map[string]int
 }
 
-// New creates a new FSM manager to register and run FSMs.
+// New creates a new Manager instance with the provided configuration.
+// It:
+//   1. Creates the in-memory database
+//   2. Initializes the persistent store
+//   3. Starts queue runners (if any queues are configured)
+//   4. Starts the admin HTTP server (listening on a Unix socket)
+//
+// The Manager is ready to use after this function returns successfully.
 func New(cfg Config) (*Manager, error) {
 	memDB, err := memdb.NewMemDB(fsmSchema)
 	if err != nil {
@@ -197,7 +239,12 @@ func New(cfg Config) (*Manager, error) {
 	return man, nil
 }
 
-// Shutdown sends a stop signal to all FSMs and blocks until they have all stopped.
+// Shutdown gracefully shuts down the Manager by:
+//   1. Cancelling all running FSMs
+//   2. Waiting for all FSMs to finish (up to timeout)
+//   3. Closing the persistent store
+//
+// This should be called during application shutdown to ensure clean termination.
 func (m *Manager) Shutdown(timeout time.Duration) {
 	m.logger.WithField("shutdown_timeout", timeout).Info("shutting down")
 
@@ -230,15 +277,21 @@ func (m *Manager) Shutdown(timeout time.Duration) {
 	m.logger.Info("shutdown complete")
 }
 
+// ActiveKey uniquely identifies an active FSM by action and version.
 type ActiveKey struct {
-	Action  string
+	// Action is the action name (e.g., "deploy").
+	Action string
+	
+	// Version is the StartVersion (ULID) of the FSM run.
 	Version ulid.ULID
 }
 
+// ActiveSet maps ActiveKeys to their current RunState (pending/running/complete).
 type ActiveSet map[ActiveKey]fsmv1.RunState
 
-// Active returns a map of active runs for the given id. The map keys are the run type and the
-// values are the run version which can be used to wait for the run to complete.
+// Active returns all active FSM runs for the given resource ID.
+// Active runs are those that are not yet complete. The returned map can be used
+// to track which actions are currently running for a resource and wait for completion.
 func (m *Manager) Active(ctx context.Context, id string) (ActiveSet, error) {
 	txn := m.db.Txn(false)
 	defer txn.Abort()
@@ -289,8 +342,11 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 	return children, nil
 }
 
-// Cancel sends a cancel signal to the FSM should it exist. It does not block until the FSM has
-// completed so callers should use Wait to ensure the FSM has stopped, if needed.
+// Cancel sends a cancellation signal to the FSM with the given version.
+// It does not block; the FSM will stop asynchronously. Use Wait() if you need
+// to ensure the FSM has fully stopped before proceeding.
+//
+// The cause string is included in the cancellation error for debugging.
 func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) error {
 	m.mu.RLock()
 	f, ok := m.running[version]
@@ -303,7 +359,11 @@ func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) e
 	return nil
 }
 
-// Wait blocks until the run with the given version completes.
+// Wait blocks until the FSM with the given version completes (successfully or with error).
+// It uses the in-memory database with watch sets for efficient waiting without polling.
+// If the FSM has already completed, it checks the history store.
+//
+// Returns nil on success, or an error if the FSM failed or was cancelled.
 func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
 	var (
 		v      = version.String()
@@ -390,7 +450,11 @@ func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
 	}
 }
 
-// WaitByID blocks until the run with the given ID completes.
+// WaitByID blocks until all FSMs with the given resource ID complete.
+// This is useful when you want to wait for any action on a resource to finish,
+// rather than waiting for a specific FSM version.
+//
+// Returns nil on success, or an error if any FSM failed or was cancelled.
 func (m *Manager) WaitByID(ctx context.Context, id string) error {
 	var (
 		logger = m.logger.WithField("fsm_run_id", id)

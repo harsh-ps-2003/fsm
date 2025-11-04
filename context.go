@@ -1,7 +1,10 @@
+// Package fsm contains context utilities for passing FSM-specific metadata
+// through the context chain (retry count, restart flag, etc.).
 package fsm
 
 import "context"
 
+// contextKey is a type-safe key for storing values in context.Context.
 type contextKey string
 
 func (c contextKey) String() string {
@@ -9,7 +12,10 @@ func (c contextKey) String() string {
 }
 
 var (
-	retryContextKey     = contextKey("retry")
+	// retryContextKey stores the current retry count in the context.
+	retryContextKey = contextKey("retry")
+	
+	// isRestartContextKey stores whether this FSM execution is a restart.
 	isRestartContextKey = contextKey("is-restart")
 )
 

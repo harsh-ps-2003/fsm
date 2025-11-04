@@ -1,3 +1,7 @@
+// Package fsm contains the admin HTTP server that exposes FSM management APIs.
+// The admin server provides endpoints for listing registered FSMs, active runs,
+// and retrieving FSM history. It communicates over HTTP/2 with h2c (cleartext)
+// over a Unix socket.
 package fsm
 
 import (
@@ -12,10 +16,15 @@ import (
 
 var _ fsmv1connect.FSMServiceHandler = (*adminServer)(nil)
 
+// adminServer implements the FSM admin API for monitoring and managing FSMs.
+// It provides endpoints to list registered FSMs, active runs, and retrieve history.
 type adminServer struct {
+	// m is the Manager instance that provides access to FSM state.
 	m *Manager
 }
 
+// ListRegistered returns all registered FSM definitions (actions, transitions, etc.).
+// This is useful for discovering what FSMs are available in the system.
 func (s *adminServer) ListRegistered(context.Context, *connect.Request[fsmv1.ListRegisteredRequest]) (*connect.Response[fsmv1.ListRegisteredResponse], error) {
 	fsms := make([]*fsmv1.FSM, 0, len(s.m.fsms))
 	for _, fsm := range s.m.fsms {
@@ -35,6 +44,8 @@ func (s *adminServer) ListRegistered(context.Context, *connect.Request[fsmv1.Lis
 	}), nil
 }
 
+// ListActive returns all currently active FSM runs (pending or running).
+// This provides visibility into what FSMs are currently executing in the system.
 func (s *adminServer) ListActive(context.Context, *connect.Request[fsmv1.ListActiveRequest]) (*connect.Response[fsmv1.ListActiveResponse], error) {
 	txn := s.m.db.Txn(false)
 	defer txn.Abort()
@@ -72,6 +83,9 @@ func (s *adminServer) ListActive(context.Context, *connect.Request[fsmv1.ListAct
 	}), nil
 }
 
+// GetHistoryEvent retrieves the complete history for a specific FSM run.
+// This includes the start event, all transition events, and the final completion event.
+// Useful for debugging and auditing FSM execution.
 func (s *adminServer) GetHistoryEvent(ctx context.Context, req *connect.Request[fsmv1.GetHistoryEventRequest]) (*connect.Response[fsmv1.HistoryEvent], error) {
 	runVersion, err := ulid.Parse(req.Msg.GetRunVersion())
 	if err != nil {

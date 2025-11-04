@@ -1,3 +1,5 @@
+// Package fsm contains runner implementations for scheduling FSM execution.
+// Runners control when and how FSMs execute (immediately, delayed, queued, etc.).
 package fsm
 
 import (
@@ -9,7 +11,16 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// runner is an interface for executing FSM functions with different scheduling strategies.
+// Implementations include:
+//   - defaultRunner: Execute immediately
+//   - delayedRunner: Execute after a delay
+//   - queuedRunner: Execute when queue capacity is available
+//   - runAfter: Execute after another FSM completes
 type runner interface {
+	// Run schedules the execution of fn. It closes ack when the FSM has been
+	// accepted for execution (not necessarily started). This allows callers
+	// to know the FSM is scheduled without blocking.
 	Run(ctx context.Context, logger logrus.FieldLogger, ack chan struct{}, fn func())
 }
 
@@ -20,6 +31,12 @@ func (r runnerFn) Run(ctx context.Context, logger logrus.FieldLogger, ack chan s
 	r(ctx, logger, fn)
 }
 
+// runnerFromOpts selects the appropriate runner based on start options.
+// It checks options in order of precedence:
+//   1. Delayed start (until time)
+//   2. Run after dependency (runAfter ULID)
+//   3. Queue assignment
+//   4. Default (immediate execution)
 func runnerFromOpts(opts *startOptions, m *Manager) runner {
 	switch {
 	case !opts.until.IsZero():
@@ -78,13 +95,20 @@ func runAfter(w waiter, after ulid.ULID) runner {
 	})
 }
 
+// queuedRunner implements rate limiting by limiting concurrent FSM executions.
+// When the queue is at capacity, new FSMs wait until capacity is available.
 type queuedRunner struct {
+	// name is the queue name (for logging).
 	name string
 
+	// inflight is the current number of FSMs executing.
+	// size is the maximum number of concurrent executions.
 	inflight, size int
 
+	// queue is the channel for submitting FSM functions to execute.
 	queue chan queueItem
 
+	// queued is a slice of FSM functions waiting for capacity.
 	queued []func()
 }
 

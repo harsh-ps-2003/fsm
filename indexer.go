@@ -1,3 +1,5 @@
+// Package fsm contains indexer implementations for the in-memory database.
+// These allow efficient querying of FSM runs by ULID fields (StartVersion, Parent, etc.).
 package fsm
 
 import (
@@ -6,7 +8,10 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
+// ulidIndexer is a custom indexer for go-memdb that indexes runState records
+// by ULID fields. It allows efficient lookups and prefix queries on ULID values.
 type ulidIndexer struct {
+	// fieldFn extracts the ULID field from a runState to index on.
 	fieldFn func(rs runState) ulid.ULID
 }
 

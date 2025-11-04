@@ -1,3 +1,4 @@
+// Package fsm contains initializer implementations that run before the first transition.
 package fsm
 
 import (
@@ -8,6 +9,9 @@ import (
 	"github.com/hashicorp/go-memdb"
 )
 
+// setStarted is an initializer that marks the FSM as RUNNING in the in-memory database.
+// This is automatically added to all FSMs when they start and allows the Manager
+// to track active FSMs for monitoring and cancellation.
 func setStarted[R, W any](db *memdb.MemDB) func(context.Context, *Request[R, W]) context.Context {
 	return func(ctx context.Context, req *Request[R, W]) context.Context {
 		var (
